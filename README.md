@@ -1,4 +1,4 @@
-# Zonos CPU-Only Fork
+# Zonos CPU-Only Fork (Currently very broken.)
 
 This is a CPU-only fork of the [Zonos voice cloning application](https://github.com/Zyphra/Zonos) that provides a user-friendly interface for voice cloning without requiring a GPU.
 
