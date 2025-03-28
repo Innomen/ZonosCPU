@@ -13,9 +13,20 @@ class PrefixConditioner(torch.nn.Module):
     Removes dependencies on kanjize, sudachipy, and other language-specific libraries
     """
     
-    def __init__(self, d_model: int = 512):
+    def __init__(self, config=None, d_model: int = 512):
         super().__init__()
-        self.d_model = d_model
+        # Handle both initialization patterns:
+        # 1. PrefixConditioner(d_model)
+        # 2. PrefixConditioner(config, dim)
+        if config is not None and isinstance(config, int):
+            # If first arg is an int, it's the old-style d_model
+            self.d_model = config
+        elif config is not None:
+            # If first arg is a config object, use d_model from second arg
+            self.d_model = d_model
+        else:
+            # Default case
+            self.d_model = d_model
         
         # English number converter
         self.inflect = inflect.engine()
