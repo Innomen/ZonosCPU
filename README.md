@@ -1,4 +1,4 @@
-# ZonosCPU: CPU-Compatible Fork of Zonos
+# ZonosCPU: CPU-Compatible Fork of Zonos (failed manus.im project)
 
 This is a CPU-only fork of the [Zonos voice cloning application](https://github.com/Zyphra/Zonos) that provides a user-friendly interface for voice cloning without requiring a GPU.
 
