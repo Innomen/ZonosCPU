@@ -43,42 +43,10 @@ class Zonos(nn.Module):
 
         if config.pad_vocab_to_multiple_of:
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
-            
-        # Register a custom hook to fix tensor dimension issues
-        self.register_load_state_dict_pre_hook(self._fix_tensor_dimensions)
 
     def _pad_embeddings_and_heads(self, *args, **kwargs):
         for w in [*self.embeddings, *self.heads]:
             pad_weight_(w, self.config.pad_vocab_to_multiple_of)
-            
-    def _fix_tensor_dimensions(self, state_dict, prefix, *args, **kwargs):
-        """
-        Custom hook to fix tensor dimension issues before loading state dict
-        """
-        # Fix SpeakerConditioner project layer dimensions
-        speaker_weight_key = "prefix_conditioner.conditioners.1.project.weight"
-        speaker_bias_key = "prefix_conditioner.conditioners.1.project.bias"
-        
-        if speaker_weight_key in state_dict:
-            # Check if dimensions need to be transposed
-            weight = state_dict[speaker_weight_key]
-            if weight.shape == torch.Size([2048, 128]):
-                # Original dimensions are correct, no need to transpose
-                pass
-            elif weight.shape == torch.Size([128, 2048]):
-                # Dimensions are reversed, transpose them
-                state_dict[speaker_weight_key] = weight.transpose(0, 1)
-            
-        # Handle unexpected keys by removing them
-        keys_to_remove = []
-        for key in state_dict:
-            if "prefix_conditioner.conditioners.1.uncond_vector" in key:
-                keys_to_remove.append(key)
-                
-        for key in keys_to_remove:
-            del state_dict[key]
-            
-        return state_dict
 
     @property
     def device(self) -> torch.device:
@@ -111,13 +79,34 @@ class Zonos(nn.Module):
         model = cls(config, backbone_cls).to(device, dtype)
         model.autoencoder.dac.to(device)
 
-        # Load state dict with strict=False to ignore missing keys
+        # Load state dict
         sd = model.state_dict()
         with safetensors.safe_open(model_path, framework="pt") as f:
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
                 
-        # Apply custom dimension fixing before loading
+        # Fix tensor dimensions before loading
+        # Check if dimensions need to be transposed for SpeakerConditioner
+        speaker_weight_key = "prefix_conditioner.conditioners.1.project.weight"
+        if speaker_weight_key in sd:
+            weight = sd[speaker_weight_key]
+            if weight.shape == torch.Size([2048, 128]):
+                # Original dimensions are correct, no need to transpose
+                pass
+            elif weight.shape == torch.Size([128, 2048]):
+                # Dimensions are reversed, transpose them
+                sd[speaker_weight_key] = weight.transpose(0, 1)
+                
+        # Handle unexpected keys by removing them
+        keys_to_remove = []
+        for key in list(sd.keys()):
+            if "prefix_conditioner.conditioners.1.uncond_vector" in key:
+                keys_to_remove.append(key)
+                
+        for key in keys_to_remove:
+            del sd[key]
+                
+        # Load state dict with strict=False to ignore missing keys
         model.load_state_dict(sd, strict=False)
 
         return model
@@ -262,67 +251,59 @@ class Zonos(nn.Module):
     @torch.inference_mode()
     def generate(
         self,
-        prefix_conditioning: torch.Tensor,  # [bsz, cond_seq_len, d_model]
-        audio_prefix_codes: torch.Tensor | None = None,  # [bsz, 9, prefix_audio_seq_len]
-        max_new_tokens: int = 86 * 30,
-        cfg_scale: float = 2.0,
-        batch_size: int = 1,
-        sampling_params: dict = dict(min_p=0.1),
-        progress_bar: bool = True,
-        disable_torch_compile: bool = False,
-        callback: Callable[[torch.Tensor, int, int], bool] | None = None,
-    ):
-        assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
-        prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
-        device = self.device
-
-        # CPU-specific modification: Disable CUDA graphs and torch.compile for CPU
-        cg = False if device.type == "cpu" else self.can_use_cudagraphs()
-        decode_one_token = self._decode_one_token
+        prefix_conditioning: torch.Tensor,
+        max_new_tokens: int = 1024,
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        cfg_scale: float = 3.0,
+        callback: Callable | None = None,
+        allow_cudagraphs: bool = True,
+    ) -> torch.Tensor:
+        """
+        Generate a sequence of tokens from a conditioning prefix.
+        """
+        # CPU-specific modification: Use float32 as default for CPU
+        dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
         
-        # CPU-specific modification: Disable torch.compile for CPU
-        if device.type != "cpu" and not (cg or disable_torch_compile):
-            try:
-                decode_one_token = torch.compile(decode_one_token, dynamic=True)
-            except Exception as e:
-                print(f"Warning: Failed to compile with error: {e}")
-                print("Continuing without compilation")
+        # Prepare the cache
+        batch_size = prefix_conditioning.size(0) // 2
+        inference_params = self.setup_cache(batch_size, max_new_tokens, dtype=dtype)
 
-        unknown_token = -1
-        audio_seq_len = prefix_audio_len + max_new_tokens
-        seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
+        # Prepare the input
+        input_ids = torch.full(
+            (batch_size, 1, self.autoencoder.num_codebooks),
+            self.masked_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
 
-        with torch.device(device):
-            inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
-            
-            # Initialize codes with audio prefix if provided
-            if audio_prefix_codes is not None:
-                codes = audio_prefix_codes.to(device)
+        # Generate the sequence
+        for i in tqdm(range(max_new_tokens)):
+            # Compute the logits
+            if i == 0:
+                logits = self._prefill(prefix_conditioning, input_ids, inference_params, cfg_scale)
             else:
-                codes = torch.full((batch_size, 9, 0), unknown_token, dtype=torch.long, device=device)
-            
-            # Generate tokens
-            pbar = tqdm(range(max_new_tokens), disable=not progress_bar)
-            for i in pbar:
-                if i == 0 and audio_prefix_codes is not None:
-                    # Skip generation for prefix tokens
-                    continue
-                
-                # Get next token
-                logits = decode_one_token(codes, inference_params, cfg_scale, allow_cudagraphs=cg)
-                next_token = sample_from_logits(logits, **sampling_params)
-                
-                # Append new token to codes
-                codes = torch.cat([codes, next_token.unsqueeze(2)], dim=2)
-                
-                # Update progress bar
-                if progress_bar:
-                    pbar.set_description(f"Generating audio: {i+1}/{max_new_tokens} tokens")
-                
-                # Call callback if provided
-                if callback is not None:
-                    stop = callback(codes, i, max_new_tokens)
-                    if stop:
-                        break
-            
-            return codes
+                logits = self._decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs)
+
+            # Sample from the logits
+            next_token_ids = sample_from_logits(
+                logits, temperature=temperature, top_p=top_p, top_k=top_k
+            )
+
+            # Check if we're done
+            if (next_token_ids == self.eos_token_id).all():
+                break
+
+            # Update the input
+            input_ids = torch.cat([input_ids, next_token_ids.unsqueeze(1)], dim=1)
+
+            # Update the cache
+            inference_params.lengths_per_sample += 1
+
+            # Call the callback
+            if callback is not None:
+                callback(i, input_ids)
+
+        # Return the generated sequence
+        return input_ids
