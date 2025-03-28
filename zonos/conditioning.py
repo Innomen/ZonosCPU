@@ -52,12 +52,12 @@ class Conditioner(nn.Module):
         return cond
 
 
-# Simplified English-only text conditioner
+# Simplified English-only text conditioner with exact dimensions
 class EnglishTextConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="espeak", **kwargs)
-        # Create a simple embedding for text
-        self.phoneme_embedder = nn.Embedding(1000, output_dim)  # Simplified embedding
+        # Create embedding with exact dimensions from original model
+        self.phoneme_embedder = nn.Embedding(189, output_dim)  # Match original size [189, 2048]
         
         # English number converter
         self.inflect = inflect.engine()
@@ -99,7 +99,7 @@ class EnglishTextConditioner(Conditioner):
             # Simple character-based tokenization
             chars = list(text)
             # Map characters to IDs (simplified)
-            ids = [min(ord(c) % 1000, 999) for c in chars]
+            ids = [min(ord(c) % 189, 188) for c in chars]  # Keep within embedding size
             token_ids.append(torch.tensor([ids], device=device))
         
         # Get embeddings
@@ -119,68 +119,76 @@ class EnglishTextConditioner(Conditioner):
         return torch.cat(padded_embeddings, dim=0)
 
 
-# Simplified emotion conditioner
+# Simplified speaker conditioner with exact dimensions
+class SpeakerConditioner(Conditioner):
+    def __init__(self, output_dim: int, **kwargs):
+        super().__init__(output_dim, name="speaker", **kwargs)
+        # Match original dimensions
+        self.project = nn.Linear(output_dim, 128)  # [2048, 128] as in original
+
+    def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+# Simplified emotion conditioner with exact dimensions
 class EmotionConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="emotion", **kwargs)
-        self.weight = nn.Parameter(torch.randn(output_dim))
+        # Match original dimensions [1024, 8]
+        self.weight = nn.Parameter(torch.randn(1024, 8))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.view(1, -1, 1)
+        # Ensure proper dimensions
+        return x @ self.weight
 
 
-# Simplified frequency conditioner
+# Simplified frequency conditioner with exact dimensions
 class FrequencyConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="fmax", **kwargs)
-        self.weight = nn.Parameter(torch.randn(output_dim))
+        # Match original dimensions [1024, 1]
+        self.weight = nn.Parameter(torch.randn(1024, 1))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.view(1, -1, 1)
+        return x @ self.weight
 
 
-# Simplified pitch conditioner
+# Simplified pitch conditioner with exact dimensions
 class PitchConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="pitch_std", **kwargs)
-        self.weight = nn.Parameter(torch.randn(output_dim))
+        # Match original dimensions [1024, 1]
+        self.weight = nn.Parameter(torch.randn(1024, 1))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.view(1, -1, 1)
+        return x @ self.weight
 
 
-# Simplified speaking rate conditioner
+# Simplified speaking rate conditioner with exact dimensions
 class SpeakingRateConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="speaking_rate", **kwargs)
-        self.weight = nn.Parameter(torch.randn(output_dim))
+        # Match original dimensions [1024, 1]
+        self.weight = nn.Parameter(torch.randn(1024, 1))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.view(1, -1, 1)
+        return x @ self.weight
 
 
-# Simplified language ID conditioner
+# Simplified language ID conditioner with exact dimensions
 class LanguageIDConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="language_id", **kwargs)
-        self.int_embedder = nn.Embedding(1, output_dim)  # Only English
+        # Match original dimensions [128, 2048]
+        self.int_embedder = nn.Embedding(128, output_dim)
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         return self.int_embedder(torch.zeros_like(x.squeeze(-1), dtype=torch.long))
-
-
-# Simplified speaker conditioner
-class SpeakerConditioner(Conditioner):
-    def __init__(self, output_dim: int, **kwargs):
-        super().__init__(output_dim, name="speaker", projection="linear", **kwargs)
-
-    def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        return x
 
 
 # Main PrefixConditioner class
@@ -190,7 +198,7 @@ class PrefixConditioner(nn.Module):
     Maintains compatibility with original model structure while removing non-English dependencies
     """
     
-    def __init__(self, config=None, d_model: int = 512):
+    def __init__(self, config=None, d_model: int = 2048):
         super().__init__()
         # Handle both initialization patterns:
         # 1. PrefixConditioner(d_model)
@@ -205,7 +213,7 @@ class PrefixConditioner(nn.Module):
             # Default case
             self.d_model = d_model
         
-        # Create conditioners similar to original structure
+        # Create conditioners similar to original structure with exact dimensions
         self.conditioners = nn.ModuleList([
             EnglishTextConditioner(self.d_model),
             SpeakerConditioner(self.d_model),
@@ -294,11 +302,11 @@ def make_cond_dict(
     
     # Create speaker embedding if not provided
     if speaker is None:
-        speaker_embedding = torch.randn(1, 512)  # Random speaker embedding
+        speaker_embedding = torch.randn(1, 2048)  # Match expected dimension
     elif isinstance(speaker, str):
         # This would normally load a speaker embedding from a file
         # For simplicity, we're creating a random tensor
-        speaker_embedding = torch.randn(1, 512)
+        speaker_embedding = torch.randn(1, 2048)  # Match expected dimension
     else:
         speaker_embedding = speaker
     
