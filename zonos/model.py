@@ -1,19 +1,16 @@
+import json
 import torch
 import torch.nn as nn
-import json
 import safetensors
-from typing import Callable
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
-from zonos.autoencoder import DACAutoencoder
+from zonos.autoencoder import Autoencoder
 from zonos.backbone import BACKBONES
-from zonos.codebook_pattern import apply_delay_pattern, revert_delay_pattern
-from zonos.conditioning import PrefixConditioner
-from zonos.config import InferenceParams, ZonosConfig
-from zonos.sampling import sample_from_logits
+from zonos.config import ZonosConfig
+from zonos.sampling import InferenceParams
 from zonos.speaker_cloning import SpeakerEmbeddingLDA
-from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
+from zonos.utils import DEFAULT_DEVICE
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 
@@ -21,27 +18,18 @@ class Zonos(nn.Module):
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
         super().__init__()
         self.config = config
-        dim = config.backbone.d_model
-        self.eos_token_id = config.eos_token_id
-        self.masked_token_id = config.masked_token_id
-
-        self.autoencoder = DACAutoencoder()
+        self.autoencoder = Autoencoder()
         self.backbone = backbone_cls(config.backbone)
-        self.prefix_conditioner = PrefixConditioner(config.prefix_conditioner, dim)
+        self.prefix_conditioner = config.prefix_conditioner.build(config.d_model)
         self.spk_clone_model = None
 
-        # TODO: pad to multiple of at least 8
-        self.embeddings = nn.ModuleList([nn.Embedding(1026, dim) for _ in range(self.autoencoder.num_codebooks)])
-        self.heads = nn.ModuleList([nn.Linear(dim, 1025, bias=False) for _ in range(self.autoencoder.num_codebooks)])
+        # Embeddings for each codebook
+        self.embeddings = nn.ModuleList([nn.Embedding(config.vocab_size, config.d_model) for _ in range(config.n_codebooks)])
+        # Heads for each codebook
+        self.heads = nn.ModuleList([nn.Linear(config.d_model, config.vocab_size) for _ in range(config.n_codebooks)])
 
-        self._cg_graph = None
-        self._cg_batch_size = None
-        self._cg_input_ids = None
-        self._cg_logits = None
-        self._cg_inference_params = None
-        self._cg_scale = None
-
-        if config.pad_vocab_to_multiple_of:
+        # Register a hook to pad the embeddings and heads to the correct size
+        if config.pad_vocab_to_multiple_of is not None:
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
 
     def _pad_embeddings_and_heads(self, *args, **kwargs):
@@ -80,7 +68,7 @@ class Zonos(nn.Module):
         model.autoencoder.dac.to(device)
 
         # Load state dict
-        sd = model.state_dict()
+        sd = {}
         with safetensors.safe_open(model_path, framework="pt") as f:
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
@@ -96,6 +84,38 @@ class Zonos(nn.Module):
             elif weight.shape == torch.Size([128, 2048]):
                 # Dimensions are reversed, transpose them
                 sd[speaker_weight_key] = weight.transpose(0, 1)
+        
+        # Fix tensor dimensions for EmotionConditioner
+        emotion_weight_key = "prefix_conditioner.conditioners.2.weight"
+        if emotion_weight_key in sd:
+            weight = sd[emotion_weight_key]
+            if weight.shape == torch.Size([1024, 8]):
+                # Transpose to match our model's dimensions [8, 2048]
+                sd[emotion_weight_key] = weight.transpose(0, 1)
+        
+        # Fix tensor dimensions for FrequencyConditioner
+        freq_weight_key = "prefix_conditioner.conditioners.3.weight"
+        if freq_weight_key in sd:
+            weight = sd[freq_weight_key]
+            if weight.shape == torch.Size([1024, 1]):
+                # Transpose to match our model's dimensions [1, 2048]
+                sd[freq_weight_key] = weight.transpose(0, 1)
+        
+        # Fix tensor dimensions for PitchConditioner
+        pitch_weight_key = "prefix_conditioner.conditioners.4.weight"
+        if pitch_weight_key in sd:
+            weight = sd[pitch_weight_key]
+            if weight.shape == torch.Size([1024, 1]):
+                # Transpose to match our model's dimensions [1, 2048]
+                sd[pitch_weight_key] = weight.transpose(0, 1)
+        
+        # Fix tensor dimensions for SpeakingRateConditioner
+        rate_weight_key = "prefix_conditioner.conditioners.5.weight"
+        if rate_weight_key in sd:
+            weight = sd[rate_weight_key]
+            if weight.shape == torch.Size([1024, 1]):
+                # Transpose to match our model's dimensions [1, 2048]
+                sd[rate_weight_key] = weight.transpose(0, 1)
                 
         # Handle unexpected keys by removing them
         keys_to_remove = []
@@ -129,181 +149,128 @@ class Zonos(nn.Module):
     def _compute_logits(
         self, hidden_states: torch.Tensor, inference_params: InferenceParams, cfg_scale: float
     ) -> torch.Tensor:
-        """
-        Pass `hidden_states` into `backbone` and `multi_head`, applying
-        classifier-free guidance if `cfg_scale != 1.0`.
-        """
-        last_hidden_states = self.backbone(hidden_states, inference_params)[:, -1, :].unsqueeze(1)
-        logits = self.apply_heads(last_hidden_states).squeeze(2).float()
+        """Compute logits for the next token."""
         if cfg_scale != 1.0:
-            cond_logits, uncond_logits = logits.chunk(2)
-            logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
-        logits[..., 1025:].fill_(-torch.inf)  # ensures padding is ignored
-        return logits
-
-    def _decode_one_token(
-        self,
-        input_ids: torch.Tensor,
-        inference_params: InferenceParams,
-        cfg_scale: float,
-        allow_cudagraphs: bool = True,
-    ) -> torch.Tensor:
-        """
-        Single-step decode. Prepares the hidden states, possibly replicates them
-        for CFG, and then delegates to `_compute_logits`.
-        
-        CPU-specific modification: Skip CUDA graph handling for CPU
-        """
-        # TODO: support cfg_scale==1
-        if cfg_scale == 1.0:
-            hidden_states = self.embed_codes(input_ids)
-            return self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-        bsz = input_ids.size(0)
-
-        # CPU-specific modification: Always use this path for CPU
-        if not allow_cudagraphs or input_ids.device.type != "cuda" or self.device.type == "cpu":
-            hidden_states_local = self.embed_codes(input_ids)
-            hidden_states_local = hidden_states_local.repeat(2, 1, 1)
-            return self._compute_logits(hidden_states_local, inference_params, cfg_scale)
-
-        # CUDA-specific code (skipped on CPU)
-        need_capture = (self._cg_graph is None) or (self._cg_batch_size != bsz)
-
-        if need_capture:
-            self._cg_graph = None
-
-            self._cg_batch_size = bsz
-            self._cg_inference_params = inference_params
-            self._cg_scale = cfg_scale
-
-            for _ in range(3):
-                hidden_states = self.embed_codes(input_ids)
-                hidden_states = hidden_states.repeat(2, 1, 1)  # because cfg != 1.0
-                logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-            self._cg_input_ids = input_ids.clone()
-            self._cg_logits = torch.empty_like(logits)
-
-            g = torch.cuda.CUDAGraph()
-
-            def capture_region():
-                hidden_states_local = self.embed_codes(self._cg_input_ids)
-                hidden_states_local = hidden_states_local.repeat(2, 1, 1)
-                self._cg_logits = self._compute_logits(hidden_states_local, self._cg_inference_params, self._cg_scale)
-
-            with torch.cuda.graph(g):
-                capture_region()
-
-            self._cg_graph = g
-
+            # Classifier-free guidance
+            uncond_hidden = self.backbone(
+                hidden_states,
+                inference_params=inference_params,
+                prefix_cond=None,
+            )
+            cond_hidden = self.backbone(
+                hidden_states,
+                inference_params=inference_params,
+                prefix_cond=inference_params.prefix_cond,
+            )
+            hidden_states = uncond_hidden + cfg_scale * (cond_hidden - uncond_hidden)
         else:
-            self._cg_input_ids.copy_(input_ids)
+            hidden_states = self.backbone(
+                hidden_states,
+                inference_params=inference_params,
+                prefix_cond=inference_params.prefix_cond,
+            )
+        return self.apply_heads(hidden_states)
 
-        self._cg_graph.replay()
+    def prepare_conditioning(self, cond_dict: dict) -> torch.Tensor:
+        """Prepare conditioning for the model."""
+        return self.prefix_conditioner(cond_dict)
 
-        return self._cg_logits
-
-    def _prefill(
-        self,
-        prefix_hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        inference_params: InferenceParams,
-        cfg_scale: float,
-    ) -> torch.Tensor:
-        """
-        "Prefill" mode: we already have `prefix_hidden_states`, and we want
-        to append new embeddings, then compute the logits.
-        """
-        # Replicate input_ids if CFG is enabled
-        if cfg_scale != 1.0:
-            input_ids = input_ids.expand(prefix_hidden_states.shape[0], -1, -1)
-        hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
-        return self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-    def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = None) -> InferenceParams:
-        # CPU-specific modification: Use float32 as default for CPU
-        if dtype is None:
-            dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
-            
-        max_seqlen = find_multiple(max_seqlen, 8)
-        key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-        lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
-        return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
-
-    def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None) -> torch.Tensor:
-        if uncond_dict is None:
-            uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-        return torch.cat(
-            [
-                self.prefix_conditioner(cond_dict),
-                self.prefix_conditioner(uncond_dict),
-            ]
-        )
-
-    def can_use_cudagraphs(self) -> bool:
-        # CPU-specific modification: Always return False for CPU
-        if self.device.type == "cpu":
-            return False
-        # Only the mamba-ssm backbone supports CUDA Graphs at the moment
-        return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
-
-    @torch.inference_mode()
     def generate(
         self,
-        prefix_conditioning: torch.Tensor,
-        max_new_tokens: int = 1024,
+        *,
+        max_n_codes: int = 1024,
         temperature: float = 1.0,
-        top_p: float = 0.95,
-        top_k: int = 50,
-        cfg_scale: float = 3.0,
-        callback: Callable | None = None,
-        allow_cudagraphs: bool = True,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        cfg_scale: float = 1.0,
+        callback=None,
+        **cond_kwargs,
     ) -> torch.Tensor:
-        """
-        Generate a sequence of tokens from a conditioning prefix.
-        """
-        # CPU-specific modification: Use float32 as default for CPU
-        dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
-        
-        # Prepare the cache
-        batch_size = prefix_conditioning.size(0) // 2
-        inference_params = self.setup_cache(batch_size, max_new_tokens, dtype=dtype)
+        """Generate audio from conditioning."""
+        device = self.device
+        cond_dict = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in cond_kwargs.items()}
+        prefix_cond = self.prepare_conditioning(cond_dict)
 
-        # Prepare the input
-        input_ids = torch.full(
-            (batch_size, 1, self.autoencoder.num_codebooks),
-            self.masked_token_id,
-            dtype=torch.long,
-            device=self.device,
+        # Initialize with a batch of BOS tokens
+        batch_size = prefix_cond.shape[0]
+        codes = torch.full((batch_size, 1, self.config.n_codebooks), 0, dtype=torch.long, device=device)
+
+        # Initialize inference parameters
+        inference_params = InferenceParams(
+            max_n_codes=max_n_codes,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            prefix_cond=prefix_cond,
+            callback=callback,
         )
 
-        # Generate the sequence
-        for i in tqdm(range(max_new_tokens)):
-            # Compute the logits
-            if i == 0:
-                logits = self._prefill(prefix_conditioning, input_ids, inference_params, cfg_scale)
-            else:
-                logits = self._decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs)
+        # Generate codes
+        with torch.no_grad():
+            for i in tqdm(range(max_n_codes), disable=callback is not None):
+                # Embed codes
+                hidden_states = self.embed_codes(codes)
 
-            # Sample from the logits
-            next_token_ids = sample_from_logits(
-                logits, temperature=temperature, top_p=top_p, top_k=top_k
+                # Compute logits
+                logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
+
+                # Sample next token
+                next_codes = inference_params.sample(logits)
+                codes = torch.cat([codes, next_codes.unsqueeze(1)], dim=1)
+
+                # Update inference parameters
+                inference_params.update(i + 1)
+
+                # Call callback if provided
+                if callback is not None:
+                    callback(i, codes)
+
+                # Check if we're done
+                if inference_params.is_done:
+                    break
+
+        # Decode codes to audio
+        with torch.no_grad():
+            audio = self.autoencoder.decode(codes[:, 1:])
+
+        return audio
+
+
+def pad_weight_(module: nn.Module, pad_to_multiple_of: int) -> None:
+    """Pad the weight of a module to a multiple of pad_to_multiple_of."""
+    if not hasattr(module, "weight"):
+        return
+
+    weight = module.weight
+    if weight.size(0) % pad_to_multiple_of == 0:
+        return
+
+    pad_size = pad_to_multiple_of - (weight.size(0) % pad_to_multiple_of)
+    weight_dtype = weight.dtype
+    weight_device = weight.device
+
+    with torch.no_grad():
+        module.weight = nn.Parameter(
+            torch.cat(
+                [
+                    weight,
+                    torch.zeros(
+                        pad_size, *weight.shape[1:], dtype=weight_dtype, device=weight_device
+                    ),
+                ],
+                dim=0,
             )
+        )
 
-            # Check if we're done
-            if (next_token_ids == self.eos_token_id).all():
-                break
-
-            # Update the input
-            input_ids = torch.cat([input_ids, next_token_ids.unsqueeze(1)], dim=1)
-
-            # Update the cache
-            inference_params.lengths_per_sample += 1
-
-            # Call the callback
-            if callback is not None:
-                callback(i, input_ids)
-
-        # Return the generated sequence
-        return input_ids
+    if hasattr(module, "bias") and module.bias is not None:
+        bias = module.bias
+        with torch.no_grad():
+            module.bias = nn.Parameter(
+                torch.cat(
+                    [
+                        bias,
+                        torch.zeros(pad_size, dtype=bias.dtype, device=bias.device),
+                    ],
+                    dim=0,
+                )
+            )
