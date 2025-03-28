@@ -1,5 +1,61 @@
 import torch
 
+class InferenceParams:
+    """Parameters for inference/generation process."""
+    def __init__(
+        self,
+        max_n_codes: int = 1024,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        prefix_cond: torch.Tensor = None,
+        callback = None,
+    ):
+        """Initialize inference parameters.
+        
+        Args:
+            max_n_codes: Maximum number of codes to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            prefix_cond: Conditioning prefix tensor
+            callback: Optional callback function called during generation
+        """
+        self.max_n_codes = max_n_codes
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.prefix_cond = prefix_cond
+        self.callback = callback
+        self.current_step = 0
+        self.is_done = False
+    
+    def update(self, step: int):
+        """Update the current step and check if generation is complete.
+        
+        Args:
+            step: Current generation step
+        """
+        self.current_step = step
+        if step >= self.max_n_codes:
+            self.is_done = True
+    
+    def sample(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample next tokens from logits.
+        
+        Args:
+            logits: Logits tensor with shape [batch_size, n_codebooks, vocab_size]
+            
+        Returns:
+            Sampled tokens with shape [batch_size, n_codebooks]
+        """
+        return sample_from_logits(
+            logits,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+        )
+
 
 def multinomial(input: torch.Tensor, num_samples: int, replacement=False, *, generator=None):
     """torch.multinomial with arbitrary number of dimensions, and number of candidates on the last dimension.
@@ -50,7 +106,7 @@ def apply_top_k(
 
     Args:
         probs (torch.Tensor): Input probabilities with token candidates on the last dimension.
-        k (int): The k in “top-k”.
+        k (int): The k in "top-k".
     Returns:
         torch.Tensor: Sampled tokens.
     """
@@ -66,7 +122,7 @@ def apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
     Args:
         probs (torch.Tensor): Input probabilities with token candidates on the last dimension.
-        p (int): The p in “top-p”.
+        p (int): The p in "top-p".
     Returns:
         torch.Tensor: Sampled tokens.
     """
