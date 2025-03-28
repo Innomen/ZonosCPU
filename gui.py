@@ -127,7 +127,7 @@ class ZonosGUI:
         log_frame = ttk.LabelFrame(main_frame, text="Log", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Add a frame for the log text and buttons
+        # Add a frame for the log text
         log_content_frame = ttk.Frame(log_frame)
         log_content_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -140,12 +140,19 @@ class ZonosGUI:
         log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.config(yscrollcommand=log_scrollbar.set)
         
-        # Add copy button for log text
-        log_button_frame = ttk.Frame(log_frame)
-        log_button_frame.pack(fill=tk.X)
+        # Add a dedicated button frame below the log text
+        copy_button_frame = ttk.Frame(main_frame)
+        copy_button_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.copy_button = ttk.Button(log_button_frame, text="Copy to Clipboard", command=self.copy_log_to_clipboard)
-        self.copy_button.pack(side=tk.RIGHT, padx=5, pady=5)
+        # Add a prominent copy button
+        copy_button = ttk.Button(copy_button_frame, text="COPY ERROR TO CLIPBOARD", 
+                                command=self.copy_log_to_clipboard, 
+                                style="Copy.TButton")
+        copy_button.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Create a custom style for the copy button to make it more prominent
+        style = ttk.Style()
+        style.configure("Copy.TButton", font=("Arial", 10, "bold"))
         
         # Status bar
         status_frame = ttk.Frame(main_frame)
@@ -165,12 +172,7 @@ class ZonosGUI:
             self.root.clipboard_clear()
             self.root.clipboard_append(log_content)
             self.status.set("Log copied to clipboard")
-            
-            # If there was an error, also copy the error specifically
-            if self.last_error:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(self.last_error)
-                self.status.set("Error message copied to clipboard")
+            messagebox.showinfo("Copied", "Error message copied to clipboard")
     
     def log(self, message):
         """Add a message to the log"""
@@ -257,7 +259,7 @@ class ZonosGUI:
                 
                 # Show a message box with copy button suggestion
                 messagebox.showerror("Model Initialization Error", 
-                                    f"{error_message}\n\nClick 'Copy to Clipboard' button to copy the full error message.")
+                                    f"{error_message}\n\nClick 'COPY ERROR TO CLIPBOARD' button to copy the full error message.")
                 return False
         return True
     
@@ -347,7 +349,7 @@ class ZonosGUI:
             
             # Show a message box with copy button suggestion
             self.root.after(0, lambda: messagebox.showerror("Audio Generation Error", 
-                                    f"{error_message}\n\nClick 'Copy to Clipboard' button to copy the full error message."))
+                                    f"{error_message}\n\nClick 'COPY ERROR TO CLIPBOARD' button to copy the full error message."))
             self.status.set("Error generating audio")
         
         finally:
