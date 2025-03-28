@@ -126,14 +126,8 @@ class SpeakerConditioner(Conditioner):
         # Override the project attribute completely with correct dimensions
         # This ensures it's not affected by the parent class initialization
         delattr(self, 'project')  # Remove the project attribute created by parent
-        self.project = nn.Linear(2048, 128)  # Correct dimensions [2048, 128]
+        self.project = nn.Linear(128, 2048)  # Correct dimensions [128, 2048] to match pretrained weights
         
-        # Force the correct bias size
-        with torch.no_grad():
-            if hasattr(self.project, 'bias') and self.project.bias is not None:
-                if self.project.bias.shape[0] != 2048:
-                    self.project.bias = nn.Parameter(torch.zeros(2048))
-
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
