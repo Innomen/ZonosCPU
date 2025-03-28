@@ -123,8 +123,8 @@ class EnglishTextConditioner(Conditioner):
 class SpeakerConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="speaker", **kwargs)
-        # Match original dimensions
-        self.project = nn.Linear(output_dim, 128)  # [2048, 128] as in original
+        # Match original dimensions - FIXED: correct order [2048, 128]
+        self.project = nn.Linear(2048, 128)  # Correct dimensions [2048, 128]
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         return x
