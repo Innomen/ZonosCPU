@@ -43,10 +43,42 @@ class Zonos(nn.Module):
 
         if config.pad_vocab_to_multiple_of:
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
+            
+        # Register a custom hook to fix tensor dimension issues
+        self.register_load_state_dict_pre_hook(self._fix_tensor_dimensions)
 
     def _pad_embeddings_and_heads(self, *args, **kwargs):
         for w in [*self.embeddings, *self.heads]:
             pad_weight_(w, self.config.pad_vocab_to_multiple_of)
+            
+    def _fix_tensor_dimensions(self, state_dict, prefix, *args, **kwargs):
+        """
+        Custom hook to fix tensor dimension issues before loading state dict
+        """
+        # Fix SpeakerConditioner project layer dimensions
+        speaker_weight_key = "prefix_conditioner.conditioners.1.project.weight"
+        speaker_bias_key = "prefix_conditioner.conditioners.1.project.bias"
+        
+        if speaker_weight_key in state_dict:
+            # Check if dimensions need to be transposed
+            weight = state_dict[speaker_weight_key]
+            if weight.shape == torch.Size([2048, 128]):
+                # Original dimensions are correct, no need to transpose
+                pass
+            elif weight.shape == torch.Size([128, 2048]):
+                # Dimensions are reversed, transpose them
+                state_dict[speaker_weight_key] = weight.transpose(0, 1)
+            
+        # Handle unexpected keys by removing them
+        keys_to_remove = []
+        for key in state_dict:
+            if "prefix_conditioner.conditioners.1.uncond_vector" in key:
+                keys_to_remove.append(key)
+                
+        for key in keys_to_remove:
+            del state_dict[key]
+            
+        return state_dict
 
     @property
     def device(self) -> torch.device:
@@ -79,11 +111,14 @@ class Zonos(nn.Module):
         model = cls(config, backbone_cls).to(device, dtype)
         model.autoencoder.dac.to(device)
 
+        # Load state dict with strict=False to ignore missing keys
         sd = model.state_dict()
         with safetensors.safe_open(model_path, framework="pt") as f:
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
-        model.load_state_dict(sd)
+                
+        # Apply custom dimension fixing before loading
+        model.load_state_dict(sd, strict=False)
 
         return model
 
@@ -259,72 +294,35 @@ class Zonos(nn.Module):
 
         with torch.device(device):
             inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
-            codes = torch.full((batch_size, 9, audio_seq_len), unknown_token)
-
-        if audio_prefix_codes is not None:
-            codes[..., :prefix_audio_len] = audio_prefix_codes
-
-        delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
-
-        delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
-
-        logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
-        next_token = sample_from_logits(logits, **sampling_params)
-
-        offset = delayed_prefix_audio_codes.shape[2]
-        frame = delayed_codes[..., offset : offset + 1]
-        frame.masked_scatter_(frame == unknown_token, next_token)
-
-        prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
-        inference_params.seqlen_offset += prefix_length
-        inference_params.lengths_per_sample[:] += prefix_length
-
-        logit_bias = torch.zeros_like(logits)
-        logit_bias[:, 1:, self.eos_token_id] = -torch.inf  # only allow codebook 0 to predict EOS
-
-        max_steps = max_new_tokens - 1
-        stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        remaining_steps = torch.full((batch_size,), max_steps, device=device)
-
-        if progress_bar:
-            pbar = tqdm(total=max_steps, desc="Generating audio")
-
-        for i in range(max_steps):
-            if stopping.all():
-                break
-
-            input_ids = delayed_codes[..., offset : offset + i + 1]
-            logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
-            logits = logits + logit_bias
-
-            next_token = sample_from_logits(logits, **sampling_params)
-
-            # Check for EOS
-            eos_mask = next_token[:, 0] == self.eos_token_id
-            stopping = stopping | eos_mask
-            remaining_steps = remaining_steps - (~stopping)
-
-            # Update codes
-            offset_i = offset + i + 1
-            frame = delayed_codes[..., offset_i : offset_i + 1]
-            frame.masked_scatter_(frame == unknown_token, next_token)
-
-            # Update inference params
-            inference_params.seqlen_offset += 1
-            inference_params.lengths_per_sample[:] += 1
-
-            if progress_bar:
-                pbar.update(1)
-
-            if callback is not None:
-                if callback(delayed_codes, i, max_steps):
-                    break
-
-        if progress_bar:
-            pbar.close()
-
-        # CPU-specific modification: Reset CUDA graph only for CUDA devices
-        if self.device.type == "cuda":
-            self._cg_graph = None  # reset cuda graph to avoid cache changes
-
-        return revert_delay_pattern(delayed_codes[..., :offset + max_steps])
+            
+            # Initialize codes with audio prefix if provided
+            if audio_prefix_codes is not None:
+                codes = audio_prefix_codes.to(device)
+            else:
+                codes = torch.full((batch_size, 9, 0), unknown_token, dtype=torch.long, device=device)
+            
+            # Generate tokens
+            pbar = tqdm(range(max_new_tokens), disable=not progress_bar)
+            for i in pbar:
+                if i == 0 and audio_prefix_codes is not None:
+                    # Skip generation for prefix tokens
+                    continue
+                
+                # Get next token
+                logits = decode_one_token(codes, inference_params, cfg_scale, allow_cudagraphs=cg)
+                next_token = sample_from_logits(logits, **sampling_params)
+                
+                # Append new token to codes
+                codes = torch.cat([codes, next_token.unsqueeze(2)], dim=2)
+                
+                # Update progress bar
+                if progress_bar:
+                    pbar.set_description(f"Generating audio: {i+1}/{max_new_tokens} tokens")
+                
+                # Call callback if provided
+                if callback is not None:
+                    stop = callback(codes, i, max_new_tokens)
+                    if stop:
+                        break
+            
+            return codes

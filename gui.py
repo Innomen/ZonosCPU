@@ -39,6 +39,7 @@ class ZonosGUI:
         self.output_path = None
         self.selected_voice_name = None
         self.model = None
+        self.last_error = None
         
         # Create voice samples directory if it doesn't exist
         self.voices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
@@ -50,6 +51,7 @@ class ZonosGUI:
             david_dest = os.path.join(self.voices_dir, "David_Attenborough.wav")
             if not os.path.exists(david_dest):
                 shutil.copy(david_sample, david_dest)
+                print("Copying David Attenborough voice sample to voices directory...")
         
         # Create the GUI
         self.create_widgets()
@@ -125,9 +127,25 @@ class ZonosGUI:
         log_frame = ttk.LabelFrame(main_frame, text="Log", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=5)
-        self.log_text.pack(fill=tk.BOTH, expand=True, pady=5)
+        # Add a frame for the log text and buttons
+        log_content_frame = ttk.Frame(log_frame)
+        log_content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.log_text = tk.Text(log_content_frame, wrap=tk.WORD, height=5)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
         self.log_text.config(state=tk.DISABLED)
+        
+        # Add scrollbar for log text
+        log_scrollbar = ttk.Scrollbar(log_content_frame, command=self.log_text.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.config(yscrollcommand=log_scrollbar.set)
+        
+        # Add copy button for log text
+        log_button_frame = ttk.Frame(log_frame)
+        log_button_frame.pack(fill=tk.X)
+        
+        self.copy_button = ttk.Button(log_button_frame, text="Copy to Clipboard", command=self.copy_log_to_clipboard)
+        self.copy_button.pack(side=tk.RIGHT, padx=5, pady=5)
         
         # Status bar
         status_frame = ttk.Frame(main_frame)
@@ -139,6 +157,20 @@ class ZonosGUI:
         # Progress bar
         self.progress = ttk.Progressbar(status_frame, mode="indeterminate")
         self.progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10, 0))
+    
+    def copy_log_to_clipboard(self):
+        """Copy log content to clipboard"""
+        log_content = self.log_text.get("1.0", tk.END).strip()
+        if log_content:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(log_content)
+            self.status.set("Log copied to clipboard")
+            
+            # If there was an error, also copy the error specifically
+            if self.last_error:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.last_error)
+                self.status.set("Error message copied to clipboard")
     
     def log(self, message):
         """Add a message to the log"""
@@ -216,8 +248,16 @@ class ZonosGUI:
                 self.log("Model initialized successfully")
                 return True
             except Exception as e:
-                self.log(f"Error initializing model: {e}")
+                error_message = f"Error initializing model: {e}"
+                self.log(error_message)
+                
+                # Store the full error message for clipboard copying
+                self.last_error = error_message + "\n" + traceback.format_exc()
                 self.log(traceback.format_exc())
+                
+                # Show a message box with copy button suggestion
+                messagebox.showerror("Model Initialization Error", 
+                                    f"{error_message}\n\nClick 'Copy to Clipboard' button to copy the full error message.")
                 return False
         return True
     
@@ -255,140 +295,64 @@ class ZonosGUI:
         self.log(f"Starting voice cloning with voice: {os.path.basename(voice_file)}")
         self.log(f"Text length: {len(text)} characters")
         
-        thread = threading.Thread(target=self._process_audio, args=(voice_file, text))
-        thread.daemon = True
-        thread.start()
+        # Clear any previous error
+        self.last_error = None
+        
+        # Start processing thread
+        threading.Thread(target=self._process_audio, args=(text, voice_file), daemon=True).start()
     
-    def _process_audio(self, voice_file, text):
+    def _process_audio(self, text, voice_file):
         """Process audio in a separate thread"""
         try:
             # Initialize model if needed
             if not self.initialize_model():
-                self.root.after(0, lambda: self._processing_error("Failed to initialize model"))
+                self.processing = False
+                self.status.set("Error initializing model")
+                self.progress.stop()
                 return
             
-            # Load the audio file
-            self.log(f"Loading voice sample: {os.path.basename(voice_file)}")
-            wav, sampling_rate = torchaudio.load(voice_file)
+            # Load voice sample
+            wav, sr = torchaudio.load(voice_file)
+            speaker = self.model.make_speaker_embedding(wav, sr)
             
-            # Generate speaker embedding
-            self.log("Generating speaker embedding...")
-            speaker = self.model.make_speaker_embedding(wav, sampling_rate)
+            # Create conditioning dictionary
+            cond_dict = make_cond_dict(text=text, speaker=speaker, language="en-us")
+            conditioning = self.model.prepare_conditioning(cond_dict)
             
-            # Process text in chunks if needed
-            chunk = self.chunk_text.get()
-            if chunk and len(text) > 150:
-                self.log(f"Chunking text into smaller segments...")
-                chunks = self._chunk_text(text)
-                all_wavs = []
-                
-                for i, chunk_text in enumerate(chunks):
-                    self.log(f"Processing chunk {i+1}/{len(chunks)}: {chunk_text[:30]}...")
-                    
-                    # Create conditioning dictionary
-                    cond_dict = make_cond_dict(text=chunk_text, speaker=speaker, language="en-us")
-                    
-                    # Prepare conditioning
-                    conditioning = self.model.prepare_conditioning(cond_dict)
-                    
-                    # Generate codes
-                    self.log(f"Generating audio codes...")
-                    codes = self.model.generate(conditioning)
-                    
-                    # Decode codes to audio
-                    self.log(f"Decoding audio...")
-                    chunk_wav = self.model.autoencoder.decode(codes)
-                    all_wavs.append(chunk_wav)
-                
-                # Concatenate all chunks
-                if all_wavs:
-                    self.log(f"Combining {len(all_wavs)} audio chunks...")
-                    wavs = torch.cat(all_wavs, dim=2)
-                else:
-                    raise ValueError("No audio chunks were processed")
-            else:
-                # Create conditioning dictionary
-                self.log("Creating conditioning...")
-                cond_dict = make_cond_dict(text=text, speaker=speaker, language="en-us")
-                
-                # Prepare conditioning
-                conditioning = self.model.prepare_conditioning(cond_dict)
-                
-                # Generate codes
-                self.log("Generating audio codes...")
-                codes = self.model.generate(conditioning)
-                
-                # Decode codes to audio
-                self.log("Decoding audio...")
-                wavs = self.model.autoencoder.decode(codes)
+            # Generate audio
+            self.log("Generating audio...")
+            codes = self.model.generate(conditioning)
             
-            # Save the audio file
-            self.output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output.wav")
-            if wavs.dim() == 3:
-                wavs = wavs[0]  # Take the first batch item if batched
+            # Decode audio
+            self.log("Decoding audio...")
+            wavs = self.model.autoencoder.decode(codes).cpu()
             
-            self.log(f"Saving audio to {self.output_path}...")
-            torchaudio.save(self.output_path, wavs.cpu(), self.model.autoencoder.sampling_rate)
+            # Save temporary output
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+            os.makedirs(output_dir, exist_ok=True)
             
-            # Update the UI
-            self.root.after(0, self._processing_complete)
+            self.output_path = os.path.join(output_dir, "output.wav")
+            torchaudio.save(self.output_path, wavs[0], self.model.autoencoder.sampling_rate)
+            
+            self.log(f"Audio generated successfully: {self.output_path}")
+            self.status.set("Audio generation complete")
             
         except Exception as e:
-            # Handle errors
-            error_message = f"Error: {str(e)}"
+            error_message = f"Error generating audio: {e}"
             self.log(error_message)
+            
+            # Store the full error message for clipboard copying
+            self.last_error = error_message + "\n" + traceback.format_exc()
             self.log(traceback.format_exc())
-            self.root.after(0, lambda: self._processing_error(error_message))
-    
-    def _chunk_text(self, text, max_length=150):
-        """Split text into chunks based on sentences"""
-        # Split by sentence endings
-        sentences = []
-        current = ""
+            
+            # Show a message box with copy button suggestion
+            self.root.after(0, lambda: messagebox.showerror("Audio Generation Error", 
+                                    f"{error_message}\n\nClick 'Copy to Clipboard' button to copy the full error message."))
+            self.status.set("Error generating audio")
         
-        # Simple sentence splitting
-        for char in text:
-            current += char
-            if char in ['.', '!', '?'] and len(current.strip()) > 0:
-                sentences.append(current)
-                current = ""
-        
-        # Add any remaining text as a sentence
-        if current.strip():
-            sentences.append(current)
-        
-        # Combine sentences into chunks
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= max_length:
-                current_chunk += sentence
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = sentence
-        
-        # Add the last chunk if it's not empty
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
-    
-    def _processing_complete(self):
-        """Called when processing is complete"""
-        self.processing = False
-        self.progress.stop()
-        self.status.set("Processing complete!")
-        self.log(f"Audio generation complete! Output saved to: {os.path.abspath(self.output_path)}")
-        messagebox.showinfo("Success", "Audio generation complete!")
-    
-    def _processing_error(self, error_message):
-        """Called when processing encounters an error"""
-        self.processing = False
-        self.progress.stop()
-        self.status.set(f"Error: {error_message}")
-        messagebox.showerror("Error", f"An error occurred: {error_message}")
+        finally:
+            self.processing = False
+            self.progress.stop()
     
     def play_audio(self):
         """Play the generated audio"""
@@ -396,20 +360,24 @@ class ZonosGUI:
             messagebox.showwarning("Playback Error", "No audio has been generated yet.")
             return
         
-        # Use appropriate command based on platform
-        if sys.platform == "win32":
-            os.startfile(self.output_path)
-        elif sys.platform == "darwin":
-            subprocess.call(["open", self.output_path])
-        else:
-            subprocess.call(["xdg-open", self.output_path])
+        # Use system default audio player
+        try:
+            if sys.platform == "win32":
+                os.startfile(self.output_path)
+            elif sys.platform == "darwin":  # macOS
+                subprocess.call(["open", self.output_path])
+            else:  # Linux
+                subprocess.call(["xdg-open", self.output_path])
+        except Exception as e:
+            messagebox.showerror("Playback Error", f"Error playing audio: {e}")
     
     def save_audio(self):
-        """Save the generated audio to a user-specified location"""
+        """Save the generated audio to a file"""
         if not self.output_path or not os.path.exists(self.output_path):
             messagebox.showwarning("Save Error", "No audio has been generated yet.")
             return
         
+        # Open file dialog to select save location
         filetypes = (
             ('WAV files', '*.wav'),
             ('All files', '*.*')
@@ -423,19 +391,26 @@ class ZonosGUI:
         )
         
         if filename:
-            shutil.copy(self.output_path, filename)
-            self.log(f"Audio saved to: {filename}")
-            messagebox.showinfo("Save", f"Audio saved to {filename}")
+            try:
+                shutil.copy(self.output_path, filename)
+                self.log(f"Audio saved to: {filename}")
+                messagebox.showinfo("Save Complete", f"Audio saved to: {filename}")
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Error saving audio: {e}")
 
 def main():
-    try:
-        root = tk.Tk()
-        app = ZonosGUI(root)
-        root.mainloop()
-    except Exception as e:
-        print(f"Error starting GUI: {e}")
-        traceback.print_exc()
-        messagebox.showerror("Error", f"Failed to start GUI: {e}")
+    # Check if GPU is available but use CPU anyway (this is a CPU-only fork)
+    if torch.cuda.is_available():
+        print("GPU detected, but this is a CPU-only fork. Will use CPU for processing.")
+    
+    # Create the main window
+    root = tk.Tk()
+    app = ZonosGUI(root)
+    
+    # Start the main loop
+    print("Starting Zonos CPU-only fork (English-only version)...")
+    print("Using GUI interface")
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
