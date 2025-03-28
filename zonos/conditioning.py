@@ -123,8 +123,16 @@ class EnglishTextConditioner(Conditioner):
 class SpeakerConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="speaker", **kwargs)
-        # Match original dimensions - FIXED: correct order [2048, 128]
+        # Override the project attribute completely with correct dimensions
+        # This ensures it's not affected by the parent class initialization
+        delattr(self, 'project')  # Remove the project attribute created by parent
         self.project = nn.Linear(2048, 128)  # Correct dimensions [2048, 128]
+        
+        # Force the correct bias size
+        with torch.no_grad():
+            if hasattr(self.project, 'bias') and self.project.bias is not None:
+                if self.project.bias.shape[0] != 2048:
+                    self.project.bias = nn.Parameter(torch.zeros(2048))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         return x
