@@ -5,7 +5,7 @@ import safetensors
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
-from zonos.autoencoder import Autoencoder
+from zonos.autoencoder import DACAutoencoder
 from zonos.backbone import BACKBONES
 from zonos.config import ZonosConfig
 from zonos.sampling import InferenceParams
@@ -18,7 +18,7 @@ class Zonos(nn.Module):
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
         super().__init__()
         self.config = config
-        self.autoencoder = Autoencoder()
+        self.autoencoder = DACAutoencoder()
         self.backbone = backbone_cls(config.backbone)
         self.prefix_conditioner = config.prefix_conditioner.build(config.d_model)
         self.spk_clone_model = None
