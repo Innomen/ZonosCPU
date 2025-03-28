@@ -23,5 +23,11 @@ class DACAutoencoder:
         return self.dac.encode(wav).audio_codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(self.dac.device.type, torch.float16, enabled=self.dac.device.type != "cpu"):
+        # Fixed implementation for CPU compatibility
+        if self.dac.device.type == "cpu":
+            # On CPU, run in float32 without autocast
             return self.dac.decode(audio_codes=codes).audio_values.unsqueeze(1).float()
+        else:
+            # On GPU, use autocast with float16
+            with torch.autocast(self.dac.device.type, torch.float16):
+                return self.dac.decode(audio_codes=codes).audio_values.unsqueeze(1).float()

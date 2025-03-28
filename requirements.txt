@@ -1,0 +1,10 @@
+torch>=1.13.0,<2.7.0
+torchaudio>=1.13.0,<2.7.0
+transformers>=4.30.0
+numpy>=1.20.0,<2.3.0
+safetensors
+huggingface_hub
+tqdm
+inflect
+# Only English dependencies are required for this simplified version
+# tkinter is a system package and cannot be installed via pip

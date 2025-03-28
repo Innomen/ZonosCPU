@@ -1,159 +1,82 @@
-# Zonos-v0.1
+# Zonos CPU-Only Fork
 
-<div align="center">
-<img src="assets/ZonosHeader.png" 
-     alt="Alt text" 
-     style="width: 500px;
-            height: auto;
-            object-position: center top;">
-</div>
-
-<div align="center">
-  <a href="https://discord.gg/gTW9JwST8q" target="_blank">
-    <img src="https://img.shields.io/badge/Join%20Our%20Discord-7289DA?style=for-the-badge&logo=discord&logoColor=white" alt="Discord">
-  </a>
-</div>
-
----
-
-Zonos-v0.1 is a leading open-weight text-to-speech model trained on more than 200k hours of varied multilingual speech, delivering expressiveness and quality on par with—or even surpassing—top TTS providers.
-
-Our model enables highly natural speech generation from text prompts when given a speaker embedding or audio prefix, and can accurately perform speech cloning when given a reference clip spanning just a few seconds. The conditioning setup also allows for fine control over speaking rate, pitch variation, audio quality, and emotions such as happiness, fear, sadness, and anger. The model outputs speech natively at 44kHz.
-
-##### For more details and speech samples, check out our blog [here](https://www.zyphra.com/post/beta-release-of-zonos-v0-1)
-
-##### We also have a hosted version available at [playground.zyphra.com/audio](https://playground.zyphra.com/audio)
-
----
-
-Zonos follows a straightforward architecture: text normalization and phonemization via eSpeak, followed by DAC token prediction through a transformer or hybrid backbone. An overview of the architecture can be seen below.
-
-<div align="center">
-<img src="assets/ArchitectureDiagram.png" 
-     alt="Alt text" 
-     style="width: 1000px;
-            height: auto;
-            object-position: center top;">
-</div>
-
----
-
-## Usage
-
-### Python
-
-```python
-import torch
-import torchaudio
-from zonos.model import Zonos
-from zonos.conditioning import make_cond_dict
-from zonos.utils import DEFAULT_DEVICE as device
-
-# model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-hybrid", device=device)
-model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
-
-wav, sampling_rate = torchaudio.load("assets/exampleaudio.mp3")
-speaker = model.make_speaker_embedding(wav, sampling_rate)
-
-cond_dict = make_cond_dict(text="Hello, world!", speaker=speaker, language="en-us")
-conditioning = model.prepare_conditioning(cond_dict)
-
-codes = model.generate(conditioning)
-
-wavs = model.autoencoder.decode(codes).cpu()
-torchaudio.save("sample.wav", wavs[0], model.autoencoder.sampling_rate)
-```
-
-### Gradio interface (recommended)
-
-```bash
-uv run gradio_interface.py
-# python gradio_interface.py
-```
-
-This should produce a `sample.wav` file in your project root directory.
-
-_For repeated sampling we highly recommend using the gradio interface instead, as the minimal example needs to load the model every time it is run._
+This is a CPU-only fork of the [Zonos voice cloning application](https://github.com/Zyphra/Zonos) that provides a user-friendly interface for voice cloning without requiring a GPU.
 
 ## Features
 
-- Zero-shot TTS with voice cloning: Input desired text and a 10-30s speaker sample to generate high quality TTS output
-- Audio prefix inputs: Add text plus an audio prefix for even richer speaker matching. Audio prefixes can be used to elicit behaviours such as whispering which can otherwise be challenging to replicate when cloning from speaker embeddings
-- Multilingual support: Zonos-v0.1 supports English, Japanese, Chinese, French, and German
-- Audio quality and emotion control: Zonos offers fine-grained control of many aspects of the generated audio. These include speaking rate, pitch, maximum frequency, audio quality, and various emotions such as happiness, anger, sadness, and fear.
-- Fast: our model runs with a real-time factor of ~2x on an RTX 4090 (i.e. generates 2 seconds of audio per 1 second of compute time)
-- Gradio WebUI: Zonos comes packaged with an easy to use gradio interface to generate speech
-- Simple installation and deployment: Zonos can be installed and deployed simply using the docker file packaged with our repository.
+- Works on CPU-only systems without requiring a GPU
+- Provides both GUI and console interfaces
+- Automatically detects and adapts to different shell environments (bash, zsh, fish)
+- Includes automatic virtual environment detection and setup
+- Supports text chunking for processing longer texts
+- Includes the David Attenborough voice sample for easy testing
 
 ## Installation
 
-#### System requirements
-
-- **Operating System:** Linux (preferably Ubuntu 22.04/24.04), macOS
-- **GPU:** 6GB+ VRAM, Hybrid additionally requires a 3000-series or newer Nvidia GPU
-
-Note: Zonos can also run on CPU provided there is enough free RAM. However, this will be a lot slower than running on a dedicated GPU, and likely won't be sufficient for interactive use.
-
-For experimental windows support check out [this fork](https://github.com/sdbds/Zonos-for-windows).
-
-See also [Docker Installation](#docker-installation)
-
-#### System dependencies
-
-Zonos depends on the eSpeak library phonemization. You can install it on Ubuntu with the following command:
-
-```bash
-apt install -y espeak-ng # For Ubuntu
-# brew install espeak-ng # For MacOS
+1. Clone this repository:
+```
+git clone https://github.com/Innomen/zonos-cpu-fork.git
+cd zonos-cpu-fork
 ```
 
-#### Python dependencies
-
-We highly recommend using a recent version of [uv](https://docs.astral.sh/uv/#installation) for installation. If you don't have uv installed, you can install it via pip: `pip install -U uv`.
-
-##### Installing into a new uv virtual environment (recommended)
-
-```bash
-uv sync
-uv sync --extra compile # optional but needed to run the hybrid
-uv pip install -e .
+2. Run the launcher script:
+```
+bash run.sh
 ```
 
-##### Installing into the system/actived environment using uv
+The launcher script will:
+- Detect your shell environment
+- Create and activate a virtual environment if needed
+- Install required dependencies
+- Check for tkinter availability
+- Launch the appropriate interface (GUI or console)
 
-```bash
-uv pip install -e .
-uv pip install -e .[compile] # optional but needed to run the hybrid
-```
+## Requirements
 
-##### Installing into the system/actived environment using pip
+- Python 3.8 or higher
+- For GUI interface: tkinter (installation instructions provided by the launcher script)
+- Internet connection for downloading the Zonos model (first run only)
 
-```bash
-pip install -e .
-pip install --no-build-isolation -e .[compile] # optional but needed to run the hybrid
-```
+## Usage
 
-##### Confirm that it's working
+### GUI Interface
 
-For convenience we provide a minimal example to check that the installation works:
+The GUI interface provides a user-friendly way to interact with the voice cloning functionality:
 
-```bash
-uv run sample.py
-# python sample.py
-```
+1. Select a voice from the dropdown or upload a new voice file
+2. Enter the text you want to synthesize
+3. Choose whether to automatically chunk text into sentences
+4. Click "Generate Audio" to create the audio
+5. Use "Play Audio" to listen to the generated audio
+6. Use "Save Audio" to save the audio to a specific location
 
-## Docker installation
+### Console Interface
 
-```bash
-git clone https://github.com/Zyphra/Zonos.git
-cd Zonos
+The console interface provides the same functionality in a text-based environment:
 
-# For gradio
-docker compose up
+1. Select a voice from the list or provide a path to a voice file
+2. Enter the text you want to synthesize
+3. Choose whether to automatically chunk text into sentences
+4. The audio will be generated and saved to the output.wav file
+5. You can choose to save the audio to a different location
 
-# Or for development you can do
-docker build -t zonos .
-docker run -it --gpus=all --net=host -v /path/to/Zonos:/Zonos -t zonos
-cd /Zonos
-python sample.py # this will generate a sample.wav in /Zonos
-```
+## Voice Samples
+
+Voice samples are stored in the `voices` directory. The David Attenborough voice sample is included by default.
+
+To add your own voice samples:
+1. Place WAV, MP3, FLAC, or OGG files in the `voices` directory
+2. Refresh the voice list in the GUI or restart the application
+
+## Troubleshooting
+
+If you encounter any issues:
+
+1. Make sure you have the required dependencies installed
+2. Check that you have sufficient disk space for the Zonos model (~3GB)
+3. For GUI issues, ensure tkinter is properly installed
+4. Check the log output for specific error messages
+
+## Credits
+
+This is a fork of the [Zonos voice cloning application](https://github.com/Zyphra/Zonos) by Zyphra, modified to work better on CPU-only systems.

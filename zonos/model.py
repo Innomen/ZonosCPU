@@ -1,9 +1,8 @@
-import json
-from typing import Callable
-
-import safetensors
 import torch
 import torch.nn as nn
+import json
+import safetensors
+from typing import Callable
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
@@ -17,7 +16,6 @@ from zonos.speaker_cloning import SpeakerEmbeddingLDA
 from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
-
 
 class Zonos(nn.Module):
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
@@ -76,7 +74,9 @@ class Zonos(nn.Module):
             if is_transformer and "torch" in BACKBONES:
                 backbone_cls = BACKBONES["torch"]
 
-        model = cls(config, backbone_cls).to(device, torch.bfloat16)
+        # CPU-specific modifications: use float32 instead of bfloat16 for CPU compatibility
+        dtype = torch.float32 if device == "cpu" else torch.bfloat16
+        model = cls(config, backbone_cls).to(device, dtype)
         model.autoencoder.dac.to(device)
 
         sd = model.state_dict()
@@ -92,7 +92,9 @@ class Zonos(nn.Module):
         if self.spk_clone_model is None:
             self.spk_clone_model = SpeakerEmbeddingLDA()
         _, spk_embedding = self.spk_clone_model(wav.to(self.spk_clone_model.device), sr)
-        return spk_embedding.unsqueeze(0).bfloat16()
+        # CPU-specific modification: use float32 instead of bfloat16 for CPU compatibility
+        dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
+        return spk_embedding.unsqueeze(0).to(dtype)
 
     def embed_codes(self, codes: torch.Tensor) -> torch.Tensor:
         return sum(emb(codes[:, i]) for i, emb in enumerate(self.embeddings))
@@ -125,10 +127,8 @@ class Zonos(nn.Module):
         """
         Single-step decode. Prepares the hidden states, possibly replicates them
         for CFG, and then delegates to `_compute_logits`.
-
-        Below we wrap this function with a simple CUDA Graph capturing mechanism,
-        doing 3 warmup steps if needed and then capturing or replaying the graph.
-        We only recapture if the batch size changes.
+        
+        CPU-specific modification: Skip CUDA graph handling for CPU
         """
         # TODO: support cfg_scale==1
         if cfg_scale == 1.0:
@@ -137,11 +137,13 @@ class Zonos(nn.Module):
 
         bsz = input_ids.size(0)
 
-        if not allow_cudagraphs or input_ids.device.type != "cuda":
+        # CPU-specific modification: Always use this path for CPU
+        if not allow_cudagraphs or input_ids.device.type != "cuda" or self.device.type == "cpu":
             hidden_states_local = self.embed_codes(input_ids)
             hidden_states_local = hidden_states_local.repeat(2, 1, 1)
             return self._compute_logits(hidden_states_local, inference_params, cfg_scale)
 
+        # CUDA-specific code (skipped on CPU)
         need_capture = (self._cg_graph is None) or (self._cg_batch_size != bsz)
 
         if need_capture:
@@ -195,7 +197,11 @@ class Zonos(nn.Module):
         hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
         return self._compute_logits(hidden_states, inference_params, cfg_scale)
 
-    def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
+    def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = None) -> InferenceParams:
+        # CPU-specific modification: Use float32 as default for CPU
+        if dtype is None:
+            dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
+            
         max_seqlen = find_multiple(max_seqlen, 8)
         key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
@@ -212,6 +218,9 @@ class Zonos(nn.Module):
         )
 
     def can_use_cudagraphs(self) -> bool:
+        # CPU-specific modification: Always return False for CPU
+        if self.device.type == "cpu":
+            return False
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
         return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
 
@@ -232,10 +241,17 @@ class Zonos(nn.Module):
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
-        # Use CUDA Graphs if supported, and torch.compile otherwise.
-        cg = self.can_use_cudagraphs()
+        # CPU-specific modification: Disable CUDA graphs and torch.compile for CPU
+        cg = False if device.type == "cpu" else self.can_use_cudagraphs()
         decode_one_token = self._decode_one_token
-        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=cg or disable_torch_compile)
+        
+        # CPU-specific modification: Disable torch.compile for CPU
+        if device.type != "cpu" and not (cg or disable_torch_compile):
+            try:
+                decode_one_token = torch.compile(decode_one_token, dynamic=True)
+            except Exception as e:
+                print(f"Warning: Failed to compile with error: {e}")
+                print("Continuing without compilation")
 
         unknown_token = -1
         audio_seq_len = prefix_audio_len + max_new_tokens
@@ -266,50 +282,49 @@ class Zonos(nn.Module):
         logit_bias = torch.zeros_like(logits)
         logit_bias[:, 1:, self.eos_token_id] = -torch.inf  # only allow codebook 0 to predict EOS
 
+        max_steps = max_new_tokens - 1
         stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        max_steps = delayed_codes.shape[2] - offset
         remaining_steps = torch.full((batch_size,), max_steps, device=device)
-        progress = tqdm(total=max_steps, desc="Generating", disable=not progress_bar)
-        cfg_scale = torch.tensor(cfg_scale)
 
-        step = 0
-        while torch.max(remaining_steps) > 0:
-            offset += 1
-            input_ids = delayed_codes[..., offset - 1 : offset]
+        if progress_bar:
+            pbar = tqdm(total=max_steps, desc="Generating audio")
+
+        for i in range(max_steps):
+            if stopping.all():
+                break
+
+            input_ids = delayed_codes[..., offset : offset + i + 1]
             logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
-            logits += logit_bias
+            logits = logits + logit_bias
 
-            next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
-            eos_in_cb0 = next_token[:, 0] == self.eos_token_id
+            next_token = sample_from_logits(logits, **sampling_params)
 
-            remaining_steps[eos_in_cb0[:, 0]] = torch.minimum(remaining_steps[eos_in_cb0[:, 0]], torch.tensor(9))
-            stopping |= eos_in_cb0[:, 0]
+            # Check for EOS
+            eos_mask = next_token[:, 0] == self.eos_token_id
+            stopping = stopping | eos_mask
+            remaining_steps = remaining_steps - (~stopping)
 
-            eos_codebook_idx = 9 - remaining_steps
-            eos_codebook_idx = torch.clamp(eos_codebook_idx, max=9 - 1)
-            for i in range(next_token.shape[0]):
-                if stopping[i]:
-                    idx = eos_codebook_idx[i].item()
-                    next_token[i, :idx] = self.masked_token_id
-                    next_token[i, idx] = self.eos_token_id
-
-            frame = delayed_codes[..., offset : offset + 1]
+            # Update codes
+            offset_i = offset + i + 1
+            frame = delayed_codes[..., offset_i : offset_i + 1]
             frame.masked_scatter_(frame == unknown_token, next_token)
+
+            # Update inference params
             inference_params.seqlen_offset += 1
             inference_params.lengths_per_sample[:] += 1
 
-            remaining_steps -= 1
+            if progress_bar:
+                pbar.update(1)
 
-            progress.update()
-            step += 1
+            if callback is not None:
+                if callback(delayed_codes, i, max_steps):
+                    break
 
-            if callback is not None and not callback(frame, step, max_steps):
-                break
+        if progress_bar:
+            pbar.close()
 
-        out_codes = revert_delay_pattern(delayed_codes)
-        out_codes.masked_fill_(out_codes >= 1024, 0)
-        out_codes = out_codes[..., : offset - 9]
+        # CPU-specific modification: Reset CUDA graph only for CUDA devices
+        if self.device.type == "cuda":
+            self._cg_graph = None  # reset cuda graph to avoid cache changes
 
-        self._cg_graph = None  # reset cuda graph to avoid cache changes
-
-        return out_codes
+        return revert_delay_pattern(delayed_codes[..., :offset + max_steps])
