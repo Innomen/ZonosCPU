@@ -136,12 +136,14 @@ class SpeakerConditioner(Conditioner):
 class EmotionConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="emotion", **kwargs)
-        # Match original dimensions [1024, 8]
-        self.weight = nn.Parameter(torch.randn(1024, 8))
+        # Match original dimensions for emotion (8 emotion categories)
+        self.weight = nn.Parameter(torch.randn(8, 2048))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure proper dimensions
+        # Normalize emotion vector to sum to 1
+        x = x / x.sum(dim=-1, keepdim=True)
+        # Transpose weight to match input dimensions [1x8]
         return x @ self.weight
 
 
@@ -149,8 +151,8 @@ class EmotionConditioner(Conditioner):
 class FrequencyConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="fmax", **kwargs)
-        # Match original dimensions [1024, 1]
-        self.weight = nn.Parameter(torch.randn(1024, 1))
+        # Match original dimensions for frequency
+        self.weight = nn.Parameter(torch.randn(1, 2048))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
@@ -161,8 +163,8 @@ class FrequencyConditioner(Conditioner):
 class PitchConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="pitch_std", **kwargs)
-        # Match original dimensions [1024, 1]
-        self.weight = nn.Parameter(torch.randn(1024, 1))
+        # Match original dimensions for pitch
+        self.weight = nn.Parameter(torch.randn(1, 2048))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
@@ -173,8 +175,8 @@ class PitchConditioner(Conditioner):
 class SpeakingRateConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, name="speaking_rate", **kwargs)
-        # Match original dimensions [1024, 1]
-        self.weight = nn.Parameter(torch.randn(1024, 1))
+        # Match original dimensions for speaking rate
+        self.weight = nn.Parameter(torch.randn(1, 2048))
         self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
